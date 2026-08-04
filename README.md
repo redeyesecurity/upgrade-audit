@@ -71,6 +71,40 @@ python3 upgrade-audit.py npm --lockfile package-lock.json --check-updates --cool
 
 If you adopt one thing from this repository, adopt the cooldown, not the tool.
 
+## Dependencies with no lockfile
+
+A lockfile is what makes "audit the diff" possible: it records the exact version
+you had, so there is something to compare against. Plenty of Python projects
+depend on ranges instead (`boto3>=1.34`) and commit no lockfile at all. Those
+projects have a blind spot that a pull-request check cannot see, because the
+version is chosen at install time and **no file in the repository changes when a
+new release lands**. A compromised release is picked up by the next build.
+
+For those, resolve first and audit what would actually be installed:
+
+```sh
+python3 upgrade-audit.py pypi --resolve requirements.txt --cooldown 3
+python3 upgrade-audit.py pypi --resolve .            # a pyproject.toml project
+```
+
+This asks pip what it would install (`--dry-run --report`, nothing is
+installed), then audits every resolved release published inside the cooldown
+window, diffing it against the release before it. Old, settled versions are
+skipped, so a run costs a couple of downloads rather than hundreds.
+
+It is worth seeing what this prints on a real repository:
+
+```
+  resolved 11 packages; auditing any published in the last 9 days
+  HIGH      boto3  1.43.62 -> 1.43.63
+      [HIGH] setup.py changed, and it executes at build/install time from an sdist
+      [MEDIUM] published 0d ago, under the 3d cooldown
+```
+
+A range resolved to a release published that same day. Nothing was wrong with
+it, but that is the window an account takeover lives in, and the repository's
+own history gave no indication anything had moved.
+
 ## Usage
 
 ```sh

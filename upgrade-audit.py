@@ -323,6 +323,54 @@ def audit(eco: str, name: str, old_version, new_version: str, cooldown: int):
     return f
 
 
+def previous_release(ad, version: str) -> str | None:
+    """The release published immediately before `version`.
+
+    Ordered by publish time rather than version number on purpose: a backport to
+    an old branch can be published after a newer release, and what we want to
+    diff against is what the world saw before this artifact appeared.
+    """
+    dated = []
+    for v in ad.versions:
+        p = ad.published(v)
+        if p:
+            dated.append((p, v))
+    dated.sort()
+    for i, (_, v) in enumerate(dated):
+        if v == version:
+            return dated[i - 1][1] if i else None
+    return None
+
+
+def resolve_pypi(target: str) -> dict[str, str]:
+    """Ask pip what it would actually install, without installing it.
+
+    Repositories that depend on ranges (`boto3>=1.34`) have no lockfile, so a
+    pull request diff cannot show a dependency change: the version is chosen at
+    install time. Resolving is the only way to see what a build would really
+    pull down today.
+    """
+    import subprocess, tempfile
+    args = ["-r", target] if os.path.isfile(target) else [target]
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "report.json")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--dry-run", "--quiet",
+             "--ignore-installed", "--report", report, *args],
+            capture_output=True, text=True)
+        if not os.path.exists(report):
+            raise RuntimeError(f"pip could not resolve {target}: "
+                               f"{(proc.stderr or proc.stdout).strip()[:400]}")
+        data = json.load(open(report))
+    out = {}
+    for item in data.get("install", []):
+        meta = item.get("metadata") or {}
+        n, v = meta.get("name"), meta.get("version")
+        if n and v:
+            out[n.lower().replace("_", "-")] = v
+    return out
+
+
 def installed_from_lockfile(path: str) -> dict[str, str]:
     d = json.load(open(path))
     out = {}
@@ -343,6 +391,9 @@ def main() -> int:
     ap.add_argument("--lockfile", help="package-lock.json to read current versions from (npm)")
     ap.add_argument("--check-updates", action="store_true",
                     help="with --lockfile: audit every dependency against its current latest")
+    ap.add_argument("--resolve", metavar="PATH",
+                    help="pypi: resolve requirements.txt or a project directory with pip and "
+                         "audit every release younger than the cooldown window")
     ap.add_argument("--batch", help="file of 'name old new' lines")
     ap.add_argument("--cooldown", type=int, default=int(os.environ.get("COOLDOWN_DAYS", 3)))
     ap.add_argument("--json", action="store_true")
@@ -355,6 +406,33 @@ def main() -> int:
             parts = line.split()
             if len(parts) == 3:
                 jobs.append((parts[0], parts[1], parts[2]))
+    elif a.resolve:
+        if a.ecosystem != "pypi":
+            print("--resolve is pypi only", file=sys.stderr)
+            return 2
+        resolved = resolve_pypi(a.resolve)
+        # Auditing all of them would mean two tarball downloads per package on
+        # every run. The ones that matter are the ones that appeared recently:
+        # a range pulls in a brand-new release the moment it is published, which
+        # is exactly the window an account takeover lives in.
+        window = max(a.cooldown, 1) * 3
+        now = datetime.datetime.now(datetime.timezone.utc)
+        print(f"  resolved {len(resolved)} packages; auditing any published in the "
+              f"last {window} days", file=sys.stderr)
+        for name, ver in sorted(resolved.items()):
+            try:
+                ad = ECOSYSTEMS["pypi"](name)
+                published = ad.published(ver)
+                if not published:
+                    continue
+                age = (now - datetime.datetime.fromisoformat(
+                    published.replace("Z", "+00:00"))).days
+                if age <= window:
+                    jobs.append((name, previous_release(ad, ver), ver))
+            except Exception:
+                continue
+        if not jobs:
+            print("  nothing resolved to a release inside the window", file=sys.stderr)
     elif a.lockfile and a.check_updates:
         for name, cur in sorted(installed_from_lockfile(a.lockfile).items()):
             if not cur:
