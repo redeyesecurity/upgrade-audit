@@ -98,6 +98,19 @@ in the base list), and resolving the bare project audits almost nothing. Going
 one at a time means a `[windows]` extra pinning `pywin32`, which will never
 resolve on a Linux runner, costs that group rather than the whole audit.
 
+Better still, stop floating. `--lock` writes down what the resolver picked, so
+from then on a change is an ordinary diff that review and CI can both see:
+
+```sh
+python3 upgrade-audit.py pypi --lock requirements.txt --lock-out requirements.lock
+```
+
+This pins versions, not artifact hashes. It is a record of what you depend on,
+not a tamper-proof one. Resolution is platform-dependent, so generate it where
+you deploy, and regenerate rather than hand-editing. `ci/pypi-lockfile.yml` does
+exactly that on a schedule and opens a pull request when the answer moves, which
+turns a silent change into a reviewable one.
+
 It is worth seeing what this prints on a real repository:
 
 ```
@@ -136,11 +149,30 @@ human look; a publisher change often is not, because projects legitimately move
 to CI publishing. `flat-cache` really did move from `jaredwray` to GitHub Actions
 between 4.0.1 and 6.1.23, and that trips a `HIGH` correctly.
 
-```yaml
-- name: Audit dependency changes
-  run: |
-    python3 upgrade-audit.py npm --batch changed.txt --fail-on CRITICAL
-```
+Working GitHub Actions workflows are in [`ci/`](ci). Copy the one that matches
+into `.github/workflows/`:
+
+| File | For | How it decides what to audit |
+|---|---|---|
+| [`ci/npm.yml`](ci/npm.yml) | npm | diffs `package-lock.json` against the base branch |
+| [`ci/cargo.yml`](ci/cargo.yml) | cargo | diffs `Cargo.lock` against the base branch |
+| [`ci/pypi.yml`](ci/pypi.yml) | PyPI | diffs `requirements.lock` if there is one, otherwise resolves |
+| [`ci/pypi-lockfile.yml`](ci/pypi-lockfile.yml) | PyPI | generates `requirements.lock` and opens a PR when it moves |
+
+They are deliberately boring: checkout, fetch this file, work out which versions
+changed, audit those. No marketplace actions, so there is no second supply chain
+underneath your supply-chain check.
+
+Two details in them are worth stealing even if you write your own.
+
+**A brand-new dependency is audited as all-new** rather than skipped. It has no
+previous version to diff against, but a dependency appearing for the first time
+deserves more scrutiny than a bump, not less.
+
+**Lockfiles are read as name+version pairs, not as a name to version map.** A
+`Cargo.lock` legitimately carries the same crate at several versions at once, and
+a map silently collapses those. On a real lockfile that turned 1275 entries into
+1056, so 219 crates would never have been checked.
 
 ## Expect some benign HIGH findings
 

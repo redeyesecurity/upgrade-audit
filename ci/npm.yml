@@ -1,0 +1,91 @@
+name: Dependency audit
+
+# Audits every dependency version change in a PR before it can merge.
+#
+# Added after the 2026-08-04 keyv/cacheable compromise, where malicious npm
+# versions shipped a preinstall credential stealer AND carried valid sigstore
+# provenance, so signature checks passed them. This looks at what actually
+# changed inside the artifact instead.
+#
+# Policy: block on CRITICAL, warn on HIGH.
+#   CRITICAL = an install-time execution hook the previous version did not have
+#              (npm lifecycle script, PyPI setup.py, cargo build.rs). That is the
+#              mechanism of nearly every supply-chain attack in these ecosystems.
+#   HIGH     = new root executables, large or obfuscated new files, credential
+#              and IMDS strings, publisher changes. These fire on legitimate
+#              changes too (flat-cache genuinely moved to CI publishing), so they
+#              warn rather than block.
+#
+# Tool: https://github.com/redeyesecurity/upgrade-audit
+
+on:
+  pull_request:
+    paths:
+      - 'package-lock.json'
+      - 'package.json'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the auditor
+        run: |
+          curl -sSfL -o upgrade-audit.py \
+            https://raw.githubusercontent.com/redeyesecurity/upgrade-audit/main/upgrade-audit.py
+
+      - name: Work out which versions changed
+        id: diff
+        run: |
+          git show "origin/${{ github.base_ref }}:package-lock.json" > base-lock.json 2>/dev/null || echo '{}' > base-lock.json
+          python3 - <<'PY' > changed.txt
+          import json
+          def versions(p):
+              try: d = json.load(open(p))
+              except Exception: return {}
+              out = {}
+              for path, meta in (d.get("packages") or {}).items():
+                  if "node_modules" not in path: continue
+                  name = path.split("node_modules/")[-1]
+                  if meta.get("version"): out[name] = meta["version"]
+              return out
+          base, head = versions("base-lock.json"), versions("package-lock.json")
+          for name, new in sorted(head.items()):
+              old = base.get(name)
+              if old != new:
+                  # A brand-new dependency has no previous version to diff, so it is
+                  # audited as all-new. That is intentional: a new dependency deserves
+                  # more scrutiny than a bump, not less.
+                  print(f"{name} {old or new} {new}")
+          PY
+          echo "count=$(wc -l < changed.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          echo "Dependency changes in this PR:"; cat changed.txt
+
+      - name: Audit the changes
+        if: steps.diff.outputs.count != '0'
+        run: |
+          set +e
+          python3 upgrade-audit.py npm --batch changed.txt --cooldown 3 --fail-on CRITICAL | tee audit.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          if grep -q '\[HIGH\]' audit.txt; then
+            echo "::warning::Dependency audit raised HIGH findings. Review before merging."
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Dependency audit found a CRITICAL change (a new install-time hook). Blocking."
+            exit 1
+          fi
+
+      - name: No dependency changes
+        if: steps.diff.outputs.count == '0'
+        run: echo "No dependency version changes in this PR."

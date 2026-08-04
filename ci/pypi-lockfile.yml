@@ -1,0 +1,89 @@
+name: Lockfile
+
+# Keeps requirements.lock in step with what pip actually resolves.
+#
+# This project declares ranges (`boto3>=1.34`). Without a lockfile there is no
+# record of what it depends on, so when a range picks up a newly published
+# release nothing in the repository changes: no commit, no pull request, and
+# nothing for a review or a CI check to look at. The build just installs
+# something different than it did yesterday.
+#
+# So this resolves on a schedule and opens a pull request when the answer moves.
+# That PR is a normal diff, which means the dependency audit runs against it and
+# a human sees the change before it reaches anything.
+#
+# Resolution is platform-dependent, so it runs on the same OS as CI and deploys.
+# Regenerating this on a laptop will produce a different answer.
+#
+# Tool: https://github.com/redeyesecurity/upgrade-audit
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the auditor
+        run: |
+          curl -sSfL -o upgrade-audit.py \
+            https://raw.githubusercontent.com/redeyesecurity/upgrade-audit/main/upgrade-audit.py
+
+      - name: Resolve
+        run: |
+          if [ -f requirements.txt ]; then TARGET=requirements.txt; else TARGET=.; fi
+          echo "Resolving $TARGET"
+          # Exits non-zero rather than writing an empty file if the resolve fails,
+          # so a broken resolve cannot land as "this project has no dependencies".
+          python3 upgrade-audit.py pypi --lock "$TARGET" --lock-out requirements.lock
+
+      - name: Open a pull request if anything moved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet -- requirements.lock; then
+            echo "No change in resolved versions."
+            exit 0
+          fi
+
+          echo "Resolved versions changed:"
+          git diff --unified=0 -- requirements.lock | grep -E '^[+-][a-z]' || true
+
+          BRANCH=deps/lockfile-refresh
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add requirements.lock
+          git commit -m "deps: refresh requirements.lock" \
+                     -m "Resolved versions moved. Opened automatically so the change is reviewable rather than silently picked up by the next build."
+          git push -f origin "$BRANCH"
+
+          cat > /tmp/pr-body.md <<'BODY'
+          The versions pip resolves for this project have moved.
+
+          Opened automatically so the change is visible and reviewable. Without a
+          lockfile this would have happened silently on the next build, with
+          nothing in the repository to show it.
+
+          The dependency audit runs against this PR, so anything that added an
+          install-time hook shows up before it merges.
+          BODY
+          sed -i 's/^          //' /tmp/pr-body.md
+
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
+            gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+              --title "deps: refresh requirements.lock" \
+              --body-file /tmp/pr-body.md
+          fi

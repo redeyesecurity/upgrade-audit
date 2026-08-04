@@ -1,0 +1,129 @@
+name: Dependency audit
+
+# Audits the dependencies this project would actually install.
+#
+# Added after the 2026-08-04 keyv/cacheable npm compromise. That campaign was
+# npm, but the mechanism is ecosystem-agnostic: a compromised maintainer account
+# publishes a version whose install step runs attacker code. On PyPI that step is
+# setup.py in an sdist. The malicious npm versions also carried valid sigstore
+# provenance, so signature checks passed them, which is why this looks at what
+# changed inside the artifact instead.
+#
+# Two modes, picked automatically:
+#
+#   requirements.lock present  ->  diff it, like any lockfile. This is the good
+#                                  case: the lockfile is the record of what we
+#                                  depend on, and lockfile.yml opens a PR when
+#                                  the resolution moves, so changes arrive as
+#                                  reviewable diffs.
+#   no lockfile                ->  resolve with pip --dry-run and audit whatever
+#                                  came out recently. Needed because a project
+#                                  on ranges changes no file when a new release
+#                                  lands, so there is no diff to gate on. This
+#                                  is why the schedule exists: the trigger is
+#                                  time, not a commit.
+#
+# Policy: block on CRITICAL, warn on HIGH.
+#   CRITICAL = an install-time execution hook the previous release did not have.
+#   HIGH     = new root executables, large or obfuscated new files, credential
+#              and IMDS strings. These fire on legitimate changes too, so they
+#              warn rather than block.
+#
+# Tool: https://github.com/redeyesecurity/upgrade-audit
+
+on:
+  pull_request:
+    paths:
+      - 'requirements*.txt'
+      - '**/requirements*.txt'
+      - 'requirements.lock'
+      - 'poetry.lock'
+      - 'pyproject.toml'
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the auditor
+        run: |
+          curl -sSfL -o upgrade-audit.py \
+            https://raw.githubusercontent.com/redeyesecurity/upgrade-audit/main/upgrade-audit.py
+
+      - name: Audit
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set +e
+
+          if [ "$EVENT" = "pull_request" ] && [ -f requirements.lock ]; then
+            python3 - <<'PY' > changed.txt
+          import os, subprocess, re
+
+          def at(ref):
+              try:
+                  return subprocess.run(["git", "show", f"{ref}:requirements.lock"],
+                                        capture_output=True, text=True, check=True).stdout
+              except subprocess.CalledProcessError:
+                  return ""
+
+          def pins(text):
+              out = {}
+              for line in text.splitlines():
+                  line = line.split("#", 1)[0].strip()
+                  m = re.match(r"^([A-Za-z0-9._-]+)==([A-Za-z0-9._+!-]+)$", line)
+                  if m:
+                      out[m.group(1).lower().replace("_", "-")] = m.group(2)
+              return out
+
+          base = pins(at("origin/" + os.environ["BASE_REF"]))
+          head = pins(at("HEAD"))
+          for name, new in sorted(head.items()):
+              old = base.get(name)
+              if old != new:
+                  # A brand-new dependency has no previous version to diff
+                  # against, so it is audited as all-new. Intentional: a new
+                  # dependency deserves more scrutiny than a bump, not less.
+                  print(f"{name} {old or new} {new}")
+          PY
+            n=$(wc -l < changed.txt | tr -d ' ')
+            echo "Lockfile changes in this PR: $n"; cat changed.txt
+            if [ "$n" = "0" ]; then echo "Nothing to audit."; exit 0; fi
+            python3 upgrade-audit.py pypi --batch changed.txt --cooldown 3 --fail-on CRITICAL | tee audit.txt
+            rc=${PIPESTATUS[0]}
+          else
+            if [ -f requirements.txt ]; then TARGET=requirements.txt; else TARGET=.; fi
+            echo "No lockfile to diff, resolving $TARGET instead"
+            python3 upgrade-audit.py pypi --resolve "$TARGET" \
+              --cooldown 3 --fail-on CRITICAL 2>&1 | tee audit.txt
+            rc=${PIPESTATUS[0]}
+            # A resolution failure is a broken environment, not a security
+            # finding. Say so loudly rather than failing every build in the repo.
+            if grep -q 'pip could not resolve' audit.txt; then
+              echo "::warning::Could not resolve dependencies, so nothing was audited."
+              exit 0
+            fi
+          fi
+
+          set -e
+          if grep -q '\[HIGH\]' audit.txt; then
+            echo "::warning::Dependency audit raised HIGH findings. Review before merging."
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Dependency audit found a CRITICAL change (a new install-time hook). Blocking."
+            exit 1
+          fi
