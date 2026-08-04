@@ -342,16 +342,35 @@ def previous_release(ad, version: str) -> str | None:
     return None
 
 
-def _extras(path: str) -> list[str]:
-    """Every extra the project declares."""
-    pyproject = os.path.join(path, "pyproject.toml")
-    if not os.path.exists(pyproject):
-        return []
+def _pyproject(path: str) -> dict:
+    p = os.path.join(path, "pyproject.toml")
+    if not os.path.exists(p):
+        return {}
     try:
         import tomllib
-        with open(pyproject, "rb") as fh:
-            data = tomllib.load(fh)
+        with open(p, "rb") as fh:
+            return tomllib.load(fh)
     except Exception:
+        return {}
+
+
+def _project_name(path: str) -> str | None:
+    """The name of the project being resolved, so it can be left out.
+
+    Resolving a directory installs the project itself alongside its
+    dependencies. Pinning your own version in your own lockfile is noise: it
+    changes on every release and there is no upstream to audit it against.
+    """
+    data = _pyproject(path)
+    name = ((data.get("project") or {}).get("name")
+            or ((data.get("tool") or {}).get("poetry") or {}).get("name"))
+    return name.lower().replace("_", "-") if name else None
+
+
+def _extras(path: str) -> list[str]:
+    """Every extra the project declares."""
+    data = _pyproject(path)
+    if not data:
         return []
     extras = list((data.get("project") or {}).get("optional-dependencies") or {})
     if not extras:
@@ -415,6 +434,10 @@ def resolve_pypi(target: str) -> dict[str, str]:
             print(f"  skipped extra [{extra}]: does not resolve here", file=sys.stderr)
             continue
         out.update(got)
+
+    own = _project_name(target)
+    if own:
+        out.pop(own, None)
     return out
 
 
