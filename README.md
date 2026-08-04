@@ -1,11 +1,14 @@
-# npm-upgrade-audit
+# upgrade-audit
 
-Check what actually changed in an npm dependency **before** you install it.
+Check what actually changed in a dependency **before** you install it.
+**npm, PyPI and crates.io.**
 
 No dependencies, no install, no account. One stdlib Python file.
 
 ```sh
-python3 npm-upgrade-audit.py keyv 4.5.4 6.0.0
+python3 upgrade-audit.py npm   keyv     4.5.4   6.0.0
+python3 upgrade-audit.py pypi  requests 2.31.0  2.32.3
+python3 upgrade-audit.py cargo serde    1.0.200 1.0.210
 ```
 
 ## Why this exists
@@ -25,13 +28,27 @@ campaign satisfied it.
 
 So this tool ignores signatures and looks at the code.
 
-## What it checks
+## The one check that matters
 
-It pulls both tarballs from the registry and diffs them.
+Every ecosystem has a place where a package runs arbitrary code on the machine
+installing it. That is where these attacks live, and it is what `CRITICAL` looks at:
+
+| Ecosystem | Install-time execution |
+|---|---|
+| npm | lifecycle scripts (`preinstall`, `install`, `postinstall`) |
+| PyPI | `setup.py` in an sdist, which executes at build time |
+| cargo | `build.rs`, which compiles and runs before your crate does |
+
+A hook that the previous version did not have is `CRITICAL`. That single rule
+would have caught the keyv compromise, the `event-stream` incident, and most of
+what came before them.
+
+## What else it checks
+
+It pulls both artifacts from the registry and diffs them.
 
 | Severity | Check | Why |
 |---|---|---|
-| `CRITICAL` | A lifecycle script (`preinstall`, `install`, `postinstall`) the previous version did not have | The mechanism behind nearly every npm supply-chain attack, including this one |
 | `HIGH` | New executable file at the package root | `setup.mjs` and `Math_Symbol.js` both landed here |
 | `HIGH` | Large new file (>200 KB) | The stealer was 728 KB in a tiny cache library |
 | `HIGH` | High-entropy new code | Packed or obfuscated payloads |
@@ -49,7 +66,7 @@ and npm pulled the versions within hours. **Anyone who refused to install
 versions younger than a few days was never exposed**, with no analysis at all.
 
 ```sh
-python3 npm-upgrade-audit.py --lockfile package-lock.json --check-updates --cooldown 7
+python3 upgrade-audit.py npm --lockfile package-lock.json --check-updates --cooldown 7
 ```
 
 If you adopt one thing from this repository, adopt the cooldown, not the tool.
@@ -58,13 +75,13 @@ If you adopt one thing from this repository, adopt the cooldown, not the tool.
 
 ```sh
 # one upgrade
-python3 npm-upgrade-audit.py keyv 4.5.4 5.6.0
+python3 upgrade-audit.py npm keyv 4.5.4 5.6.0
 
 # everything in a lockfile that has a newer version available
-python3 npm-upgrade-audit.py --lockfile package-lock.json --check-updates
+python3 upgrade-audit.py npm --lockfile package-lock.json --check-updates
 
 # a batch, machine readable, for CI
-python3 npm-upgrade-audit.py --batch pkgs.txt --json --fail-on CRITICAL
+python3 upgrade-audit.py npm --batch pkgs.txt --json --fail-on CRITICAL
 ```
 
 `pkgs.txt` is `name old_version new_version`, one per line.
@@ -82,8 +99,20 @@ between 4.0.1 and 6.1.23, and that trips a `HIGH` correctly.
 ```yaml
 - name: Audit dependency changes
   run: |
-    python3 npm-upgrade-audit.py --batch changed.txt --fail-on CRITICAL
+    python3 upgrade-audit.py npm --batch changed.txt --fail-on CRITICAL
 ```
+
+## Expect some benign HIGH findings
+
+Real examples from live packages, all correct and all harmless:
+
+- `flat-cache` moved from an individual maintainer to GitHub Actions publishing, which trips `publisher-change`
+- `serde` changed its `build.rs` between 1.0.200 and 1.0.210, which trips `changed-install-hook`
+- `requests` restructured into `src/`, so files look new
+
+This is why the recommended policy is **block on `CRITICAL`, warn on `HIGH`**. A
+new install hook is nearly always worth a human look. A new publisher usually is
+not. A tool that pretends it has no false positives is one nobody keeps running.
 
 ## What this does not do
 
