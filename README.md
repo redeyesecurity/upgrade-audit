@@ -92,6 +92,12 @@ installed), then audits every resolved release published inside the cooldown
 window, diffing it against the release before it. Old, settled versions are
 skipped, so a run costs a couple of downloads rather than hundreds.
 
+Extras are resolved too, one group at a time. Projects park the interesting
+dependencies there (a lake sink's `boto3` and `pyarrow` under `[parquet]`, not
+in the base list), and resolving the bare project audits almost nothing. Going
+one at a time means a `[windows]` extra pinning `pywin32`, which will never
+resolve on a Linux runner, costs that group rather than the whole audit.
+
 It is worth seeing what this prints on a real repository:
 
 ```

@@ -342,6 +342,44 @@ def previous_release(ad, version: str) -> str | None:
     return None
 
 
+def _extras(path: str) -> list[str]:
+    """Every extra the project declares."""
+    pyproject = os.path.join(path, "pyproject.toml")
+    if not os.path.exists(pyproject):
+        return []
+    try:
+        import tomllib
+        with open(pyproject, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception:
+        return []
+    extras = list((data.get("project") or {}).get("optional-dependencies") or {})
+    if not extras:
+        extras = list(((data.get("tool") or {}).get("poetry") or {}).get("extras") or {})
+    return extras
+
+
+def _pip_resolve(args: list[str]) -> tuple[dict[str, str], str]:
+    """(resolved versions, error). Installs nothing."""
+    import subprocess, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        report = os.path.join(tmp, "report.json")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--dry-run", "--quiet",
+             "--ignore-installed", "--report", report, *args],
+            capture_output=True, text=True)
+        if not os.path.exists(report):
+            return {}, (proc.stderr or proc.stdout).strip()[:400]
+        data = json.load(open(report))
+    out = {}
+    for item in data.get("install", []):
+        meta = item.get("metadata") or {}
+        n, v = meta.get("name"), meta.get("version")
+        if n and v:
+            out[n.lower().replace("_", "-")] = v
+    return out, ""
+
+
 def resolve_pypi(target: str) -> dict[str, str]:
     """Ask pip what it would actually install, without installing it.
 
@@ -350,24 +388,33 @@ def resolve_pypi(target: str) -> dict[str, str]:
     install time. Resolving is the only way to see what a build would really
     pull down today.
     """
-    import subprocess, tempfile
-    args = ["-r", target] if os.path.isfile(target) else [target]
-    with tempfile.TemporaryDirectory() as tmp:
-        report = os.path.join(tmp, "report.json")
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--dry-run", "--quiet",
-             "--ignore-installed", "--report", report, *args],
-            capture_output=True, text=True)
-        if not os.path.exists(report):
-            raise RuntimeError(f"pip could not resolve {target}: "
-                               f"{(proc.stderr or proc.stdout).strip()[:400]}")
-        data = json.load(open(report))
-    out = {}
-    for item in data.get("install", []):
-        meta = item.get("metadata") or {}
-        n, v = meta.get("name"), meta.get("version")
-        if n and v:
-            out[n.lower().replace("_", "-")] = v
+    if os.path.isfile(target):
+        out, err = _pip_resolve(["-r", target])
+        if err:
+            raise RuntimeError(f"pip could not resolve {target}: {err}")
+        return out
+
+    # Projects routinely park the interesting dependencies in extras: a lake
+    # sink's boto3 and pyarrow live under [parquet], not in the base list, so
+    # resolving the bare project would audit almost nothing.
+    out, err = _pip_resolve([target])
+    if err:
+        raise RuntimeError(f"pip could not resolve {target}: {err}")
+
+    extras = _extras(target)
+    if not extras:
+        return out
+
+    # One extra at a time. Asking for all of them at once fails outright the
+    # moment any single extra cannot be satisfied here, and a [windows] extra
+    # pinning pywin32 will never resolve on a Linux runner. Per-extra means one
+    # unsatisfiable group costs that group, not the whole audit.
+    for extra in extras:
+        got, err = _pip_resolve([f"{target}[{extra}]"])
+        if err:
+            print(f"  skipped extra [{extra}]: does not resolve here", file=sys.stderr)
+            continue
+        out.update(got)
     return out
 
 
