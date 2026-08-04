@@ -25,6 +25,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Used only for the fallback below, when the org forbids Actions from opening
+  # pull requests.
+  issues: write
 
 jobs:
   lock:
@@ -86,8 +89,43 @@ jobs:
           BODY
           sed -i 's/^          //' /tmp/pr-body.md
 
-          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
-            gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
-              --title "deps: refresh requirements.lock" \
-              --body-file /tmp/pr-body.md
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
+            echo "A pull request for $BRANCH is already open."
+            exit 0
+          fi
+
+          if gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+               --title "deps: refresh requirements.lock" --body-file /tmp/pr-body.md; then
+            exit 0
+          fi
+
+          # Some organisations forbid Actions from opening pull requests. The
+          # branch is already pushed, so the work is not lost: raise an issue so
+          # a human still finds out, rather than failing the run and leaving the
+          # change sitting on a branch nobody looks at.
+          echo "::warning::Could not open a pull request, opening an issue instead."
+          {
+            echo "The resolved dependency versions for this project have moved."
+            echo
+            echo "The refreshed lockfile is pushed to \`$BRANCH\`, but this org does"
+            echo "not permit GitHub Actions to open pull requests, so it needs one"
+            echo "raised by hand:"
+            echo
+            echo "    ${{ github.server_url }}/${{ github.repository }}/compare/$BRANCH?expand=1"
+            echo
+            echo "What changed:"
+            echo
+            echo '```'
+            git diff --unified=0 "origin/${{ github.event.repository.default_branch }}...$BRANCH" -- requirements.lock \
+              | grep -E '^[+-][a-z]' || true
+            echo '```'
+          } > /tmp/issue-body.md
+
+          existing=$(gh issue list --state open --search "requirements.lock in:title" \
+                      --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/issue-body.md
+          else
+            gh issue create --title "deps: requirements.lock needs refreshing" \
+              --body-file /tmp/issue-body.md
           fi
